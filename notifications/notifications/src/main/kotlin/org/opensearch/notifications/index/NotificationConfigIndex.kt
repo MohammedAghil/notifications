@@ -10,17 +10,12 @@ import org.opensearch.action.DocWriteResponse
 import org.opensearch.action.admin.indices.create.CreateIndexRequest
 import org.opensearch.action.admin.indices.create.CreateIndexResponse
 import org.opensearch.action.admin.indices.mapping.put.PutMappingRequest
-import org.opensearch.action.bulk.BulkRequest
 import org.opensearch.action.bulk.BulkResponse
-import org.opensearch.action.delete.DeleteRequest
 import org.opensearch.action.delete.DeleteResponse
-import org.opensearch.action.get.GetRequest
 import org.opensearch.action.get.GetResponse
 import org.opensearch.action.get.MultiGetRequest
 import org.opensearch.action.get.MultiGetResponse
-import org.opensearch.action.index.IndexRequest
 import org.opensearch.action.index.IndexResponse
-import org.opensearch.action.search.SearchRequest
 import org.opensearch.action.search.SearchResponse
 import org.opensearch.action.support.clustermanager.AcknowledgedResponse
 import org.opensearch.cluster.service.ClusterService
@@ -46,16 +41,21 @@ import org.opensearch.notifications.model.DocMetadata.Companion.METADATA_TAG
 import org.opensearch.notifications.model.NotificationConfigDoc
 import org.opensearch.notifications.model.NotificationConfigDocInfo
 import org.opensearch.notifications.settings.PluginSettings
+import org.opensearch.notifications.util.SdkClientHelper
 import org.opensearch.notifications.util.SecureIndexClient
 import org.opensearch.notifications.util.SuspendUtils.Companion.suspendUntil
 import org.opensearch.notifications.util.SuspendUtils.Companion.suspendUntilTimeout
+import org.opensearch.remote.metadata.client.BulkDataObjectRequest
+import org.opensearch.remote.metadata.client.DeleteDataObjectRequest
+import org.opensearch.remote.metadata.client.GetDataObjectRequest
+import org.opensearch.remote.metadata.client.PutDataObjectRequest
 import org.opensearch.remote.metadata.client.SdkClient
+import org.opensearch.remote.metadata.client.SearchDataObjectRequest
 import org.opensearch.script.Script
 import org.opensearch.search.SearchHit
 import org.opensearch.search.builder.SearchSourceBuilder
 import org.opensearch.search.sort.SortOrder
 import org.opensearch.transport.client.Client
-import java.lang.IllegalArgumentException
 import java.util.concurrent.TimeUnit
 
 /**
@@ -82,6 +82,7 @@ internal object NotificationConfigIndex : ConfigOperations {
     private lateinit var client: Client
     private lateinit var clusterService: ClusterService
     private lateinit var sdkClient: SdkClient
+    private lateinit var sdkClientHelper: SdkClientHelper
 
     private val searchHitParser = object : SearchResults.SearchHitParser<NotificationConfigInfo> {
         override fun parse(searchHit: SearchHit): NotificationConfigInfo {
@@ -108,6 +109,7 @@ internal object NotificationConfigIndex : ConfigOperations {
         NotificationConfigIndex.client = SecureIndexClient(client)
         NotificationConfigIndex.clusterService = clusterService
         NotificationConfigIndex.sdkClient = sdkClient
+        sdkClientHelper = SdkClientHelper()
     }
 
     private fun getSchemaVersionFromIndexMapping(indexMapping: Map<String, Any>?): Int {
@@ -185,14 +187,19 @@ internal object NotificationConfigIndex : ConfigOperations {
      */
     override suspend fun createNotificationConfig(configDoc: NotificationConfigDoc, id: String?): String? {
         createIndex()
-        val indexRequest = IndexRequest(INDEX_NAME)
-            .source(configDoc.toXContent())
-            .create(true)
+        val postRequest = PutDataObjectRequest.builder()
+            .index(INDEX_NAME)
+            .dataObject({ builder, params -> configDoc.toXContent(builder, params) })
+            .overwriteIfExists(false)
         if (id != null) {
-            indexRequest.id(id)
+            postRequest.id(id)
         }
-        val response: IndexResponse = client.suspendUntilTimeout(PluginSettings.operationTimeoutMs) {
-            index(indexRequest, it)
+
+        val response: IndexResponse = sdkClientHelper.suspendUntilTimeoutAndParse(
+            IndexResponse::class.java,
+            PluginSettings.operationTimeoutMs
+        ) {
+            sdkClient.putDataObjectAsync(postRequest.build())
         }
         return if (response.result != DocWriteResponse.Result.CREATED) {
             log.warn("$LOG_PREFIX:createNotificationConfig - response:$response")
@@ -220,9 +227,16 @@ internal object NotificationConfigIndex : ConfigOperations {
      */
     override suspend fun getNotificationConfig(id: String): NotificationConfigDocInfo? {
         createIndex()
-        val getRequest = GetRequest(INDEX_NAME).id(id)
-        val response: GetResponse = client.suspendUntilTimeout(PluginSettings.operationTimeoutMs) {
-            get(getRequest, it)
+        val getRequest = GetDataObjectRequest.builder()
+            .index(INDEX_NAME)
+            .id(id)
+            .build()
+
+        val response = sdkClientHelper.suspendUntilTimeoutAndParse(
+            GetResponse::class.java,
+            PluginSettings.operationTimeoutMs
+        ) {
+            sdkClient.getDataObjectAsync(getRequest)
         }
         return parseNotificationConfigDoc(id, response)
     }
@@ -274,11 +288,16 @@ internal object NotificationConfigIndex : ConfigOperations {
         }
         ConfigQueryHelper.addQueryFilters(query, request.filterParams)
         sourceBuilder.query(query)
-        val searchRequest = SearchRequest()
+        val searchRequest = SearchDataObjectRequest.builder()
             .indices(INDEX_NAME)
-            .source(sourceBuilder)
-        val response: SearchResponse = client.suspendUntilTimeout(PluginSettings.operationTimeoutMs) {
-            search(searchRequest, it)
+            .searchSourceBuilder(sourceBuilder)
+            .build()
+
+        val response = sdkClientHelper.suspendUntilTimeoutAndParse(
+            SearchResponse::class.java,
+            PluginSettings.operationTimeoutMs
+        ) {
+            sdkClient.searchDataObjectAsync(searchRequest)
         }
         val result = NotificationConfigSearchResult(request.fromIndex.toLong(), response, searchHitParser)
         log.info(
@@ -294,12 +313,18 @@ internal object NotificationConfigIndex : ConfigOperations {
      */
     override suspend fun updateNotificationConfig(id: String, notificationConfigDoc: NotificationConfigDoc): Boolean {
         createIndex()
-        val indexRequest = IndexRequest(INDEX_NAME)
-            .source(notificationConfigDoc.toXContent())
-            .create(false)
+        val putRequest = PutDataObjectRequest.builder()
+            .index(INDEX_NAME)
             .id(id)
-        val response: IndexResponse = client.suspendUntilTimeout(PluginSettings.operationTimeoutMs) {
-            index(indexRequest, it)
+            .dataObject({ builder, params -> notificationConfigDoc.toXContent(builder, params) })
+            .overwriteIfExists(true)
+            .build()
+
+        val response = sdkClientHelper.suspendUntilTimeoutAndParse(
+            IndexResponse::class.java,
+            PluginSettings.operationTimeoutMs
+        ) {
+            sdkClient.putDataObjectAsync(putRequest)
         }
         if (response.result != DocWriteResponse.Result.UPDATED) {
             log.warn("$LOG_PREFIX:updateNotificationConfig failed for $id; response:$response")
@@ -312,12 +337,16 @@ internal object NotificationConfigIndex : ConfigOperations {
      */
     override suspend fun deleteNotificationConfig(id: String): Boolean {
         createIndex()
-        val deleteRequest = DeleteRequest()
+        val deleteRequest = DeleteDataObjectRequest.builder()
             .index(INDEX_NAME)
             .id(id)
+            .build()
 
-        val response: DeleteResponse = client.suspendUntilTimeout(PluginSettings.operationTimeoutMs) {
-            delete(deleteRequest, it)
+        val response = sdkClientHelper.suspendUntilTimeoutAndParse(
+            DeleteResponse::class.java,
+            PluginSettings.operationTimeoutMs
+        ) {
+            sdkClient.deleteDataObjectAsync(deleteRequest)
         }
         if (response.result != DocWriteResponse.Result.DELETED) {
             log.warn("$LOG_PREFIX:deleteNotificationConfig failed for $id; response:$response")
@@ -330,15 +359,24 @@ internal object NotificationConfigIndex : ConfigOperations {
      */
     override suspend fun deleteNotificationConfigs(ids: Set<String>): Map<String, RestStatus> {
         createIndex()
-        val bulkRequest = BulkRequest()
+
+        val bulkDeleteRequest = BulkDataObjectRequest.builder()
+            .globalIndex(INDEX_NAME)
+            .build()
         ids.forEach {
-            val deleteRequest = DeleteRequest()
-                .index(INDEX_NAME)
-                .id(it)
-            bulkRequest.add(deleteRequest)
+            bulkDeleteRequest.add(
+                DeleteDataObjectRequest.builder()
+                    .index(INDEX_NAME)
+                    .id(it)
+                    .build()
+            )
         }
-        val response: BulkResponse = client.suspendUntilTimeout(PluginSettings.operationTimeoutMs) {
-            bulk(bulkRequest, it)
+
+        val response: BulkResponse = sdkClientHelper.suspendUntilTimeoutAndParse(
+            BulkResponse::class.java,
+            PluginSettings.operationTimeoutMs
+        ) {
+            sdkClient.bulkDataObjectAsync(bulkDeleteRequest)
         }
         val mutableMap = mutableMapOf<String, RestStatus>()
         response.forEach {
